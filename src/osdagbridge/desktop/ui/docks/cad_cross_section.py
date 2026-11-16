@@ -5,9 +5,9 @@ Author: Arushi
 """
 
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon, QPixmap
+from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal
+from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon, QPixmap, QDoubleValidator
 from osdagbridge.core.utils.common import *
 from osdagbridge.desktop.cad.irc5_geometry import (
     CrashBarrierGeometry,
@@ -18,6 +18,9 @@ from osdagbridge.desktop.cad.irc5_geometry import (
 
 class CrossSectionCADWidget(QWidget):
     """Widget for drawing bridge cross-section view"""
+
+    # Emits the original bridge-input key and its value in the input field unit.
+    dimensionEdited = Signal(str, float)
     # ===== SHARED CAD COLORS =====
     GIRDER_COLOR = QColor(179, 180, 160) 
     STIFFENER_COLOR = QColor(210, 210, 205)
@@ -51,7 +54,10 @@ class CrossSectionCADWidget(QWidget):
         self.cross_section_hover_zones = []  # Store hover zones as (QRectF, element_type)
         self.interactive_hover = True
         self.highlighted_girder_index = -1
-
+        # Rebuilt during painting: (label rectangle, parameter key, input key, unit factor).
+        self.editable_dimensions = []
+        self._dimension_editor = None
+        self._active_dimension = None
         # Scale factor for diagram size (1.0 = normal, <1.0 = smaller)
         self.scale_factor = 1.0
 
@@ -510,7 +516,23 @@ class CrossSectionCADWidget(QWidget):
         self._position_zoom_buttons()
     
     def update_params(self, params: dict):
+        # Changing deck thickness must not change the horizontal CAD scale.
+        # The saved height is converted back to a scale using model height;
+        # adjust it proportionally so the scale remains constant after edits.
+        old_model_height = self._compute_model_height_mm()
+        old_saved_height = self._saved_cad_height_px
+
         self.params.update(params)
+
+        if (
+            "deck_thickness" in params
+            and old_saved_height is not None
+            and old_model_height > 0
+        ):
+            new_model_height = self._compute_model_height_mm()
+            self._saved_cad_height_px = (
+                old_saved_height * new_model_height / old_model_height
+            )
 
         if "span_length" in params:
             self.show_span_values = True
@@ -692,6 +714,89 @@ class CrossSectionCADWidget(QWidget):
 
         self.update_params(params)
 
+    def _register_editable_dimension(self, rect, param_key, input_key, unit_factor):
+        """Register a visible dimension label as an editable hit target."""
+        self.editable_dimensions.append(
+            (QRectF(rect), param_key, input_key, float(unit_factor))
+        )
+
+    def _begin_dimension_edit(self, rect, param_key, input_key, unit_factor):
+        """Show a small in-place editor over the selected dimension label."""
+        if self._dimension_editor is not None:
+            self._dimension_editor.deleteLater()
+            self._dimension_editor = None
+
+        current_value = float(self.params.get(param_key, 0)) / unit_factor
+        editor = QLineEdit(self)
+        editor.setGeometry(rect.toAlignedRect().adjusted(-2, -2, 2, 2))
+        editor.setAlignment(Qt.AlignCenter)
+        editor.setText(f"{current_value:.3f}".rstrip("0").rstrip("."))
+        editor.setValidator(QDoubleValidator(0.001, 100000.0, 3, editor))
+        editor.setStyleSheet(
+            "QLineEdit { background: white; color: #111; "
+            "border: 2px solid #2D7FF9; border-radius: 3px; padding: 2px; }"
+        )
+        editor.setToolTip("Enter a positive value and press Enter.")
+        self._active_dimension = (param_key, input_key, unit_factor)
+        self._dimension_editor = editor
+        editor.editingFinished.connect(self._finish_dimension_edit)
+        editor.show()
+        editor.raise_()
+        editor.setFocus()
+        editor.selectAll()
+
+    def _finish_dimension_edit(self):
+        """Validate and apply the edited value, then notify the parent UI."""
+        editor = self._dimension_editor
+        active = self._active_dimension
+        if editor is None or active is None:
+            return
+
+        text = editor.text().strip()
+        param_key, input_key, unit_factor = active
+
+        try:
+            value = float(text)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError
+
+            # Carriageway Width is specified per carriageway (metres).
+            # Clamp it to the same limits as the Basic Inputs field.
+            if input_key == KEY_CARRIAGEWAY_WIDTH:
+                value = max(4.25, min(23.6, value))
+        except (TypeError, ValueError):
+            value = None
+
+        self._dimension_editor = None
+        self._active_dimension = None
+        editor.hide()
+        editor.deleteLater()
+
+        if value is None:
+            self.setFocus()
+            return
+
+        # CAD geometry stores dimensions in millimetres; the main form may
+        # store them in metres (factor 1000) or millimetres (factor 1).
+        # Let update_params compare the old and new model heights before
+        # applying the value; pre-setting self.params here breaks that check.
+        self.show_carriageway_values = True
+        self.update_params({param_key: value * unit_factor})
+        self.dimensionEdited.emit(str(input_key), float(value))
+        self.setFocus()
+
+    def mouseDoubleClickEvent(self, event):
+        """Open an in-place editor only when an editable dimension is double-clicked."""
+        position = event.position() if hasattr(event, "position") else event.pos()
+
+        for rect, param_key, input_key, unit_factor in reversed(self.editable_dimensions):
+            if rect.contains(position):
+                self._begin_dimension_edit(rect, param_key, input_key, unit_factor)
+                event.accept()
+                return
+
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
         """Handle mouse hover for both labels and structural elements"""
         if not getattr(self, 'interactive_hover', True):
@@ -729,6 +834,7 @@ class CrossSectionCADWidget(QWidget):
         # clear hover labels and zones at start of each paint
         self.hover_labels = []
         self.cross_section_hover_zones = []
+        self.editable_dimensions = []
         
         painter = QPainter(self)
         try:
@@ -846,8 +952,28 @@ class CrossSectionCADWidget(QWidget):
             metrics = painter.fontMetrics()
             text_width = metrics.boundingRect(text).width()
             
-            self.draw_text_with_background(painter, text_x - text_width/2, text_y, text, 
+            label_x = text_x - text_width / 2
+            self.draw_text_with_background(painter, label_x, text_y, text,
                                         QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+
+            # Only these two horizontal dimensions are editable in this view.
+            dimension_name = text.split("=", 1)[0].strip()
+            if dimension_name == "Carriageway Width":
+                label_rect = QRectF(
+                    label_x - 12, text_y - metrics.height() - 8,
+                    text_width + 24, metrics.height() + 16
+                )
+                self._register_editable_dimension(
+                    label_rect, "carriageway_width", KEY_CARRIAGEWAY_WIDTH, 1000
+                )
+            elif dimension_name == "Girder Spacing":
+                label_rect = QRectF(
+                    label_x - 12, text_y - metrics.height() - 8,
+                    text_width + 24, metrics.height() + 16
+                )
+                self._register_editable_dimension(
+                    label_rect, "girder_spacing", KEY_TS_GIRDER_SPACING, 1000
+                )
         else:
             top_arrow = [
                 QPointF(x1, y1),
@@ -1642,11 +1768,15 @@ class CrossSectionCADWidget(QWidget):
         deck_overhang_px = self.params.get('deck_overhang', 1000) * scale
         
         if n > 1:
-            first_girder_x = deck_left_x + deck_overhang_px
-            last_girder_x = deck_right_x - deck_overhang_px
-            available_for_spacing = last_girder_x - first_girder_x
-            actual_spacing_px = available_for_spacing / (n - 1) if n > 1 else 0
-            positions = [first_girder_x + i * actual_spacing_px for i in range(n)]
+            # Place girders using the actual editable girder-spacing parameter.
+            # Keep the complete girder group centred on the bridge deck.
+            requested_spacing_px = self.params.get('girder_spacing', 2750) * scale
+            group_width_px = requested_spacing_px * (n - 1)
+            first_girder_x = center_x - group_width_px / 2.0
+            positions = [
+                first_girder_x + i * requested_spacing_px
+                for i in range(n)
+            ]
         else:
             positions = [center_x]
 
@@ -2287,6 +2417,17 @@ class CrossSectionCADWidget(QWidget):
             
             self.draw_text_with_background(painter, text_x, text_y, text,
                                         QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+
+            # Generous hit target: the visible text and nearby label area
+            # should both activate the in-place editor.
+            deck_label_rect = QRectF(
+                text_x - 18, text_y - metrics.height() - 12,
+                text_width + 36, metrics.height() + 24
+            )
+            self._register_editable_dimension(
+                deck_label_rect, "deck_thickness", KEY_TS_DECK_THICKNESS, 1
+            )
+
     def add_cross_section_hover_labels(self, painter, carriageway_start_x, carriageway_end_x,
                     left_barrier_x, right_barrier_x, deck_top_y, deck_bottom_y,
                     deck_thick_px, positions, base_y, scale, n, fp_config,
