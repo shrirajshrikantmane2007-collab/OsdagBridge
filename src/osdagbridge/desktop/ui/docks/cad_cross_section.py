@@ -5,7 +5,7 @@ Author: Arushi
 """
 
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit
+from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit, QToolTip
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon, QPixmap, QDoubleValidator
 from osdagbridge.core.utils.common import *
@@ -35,7 +35,24 @@ class CrossSectionCADWidget(QWidget):
     MEDIAN_COLOR = QColor(221, 221, 221)
 
     BEARING_COLOR = QColor(255, 0, 0)
-    
+
+    # ===== DECK THICKNESS: ACTUAL vs VISUAL =====
+    # Accepted range for the *actual* engineering value (mm).  1 mm is allowed
+    # on purpose; the drawing guards against it with a visual minimum below.
+    DECK_THICKNESS_MIN_MM = 1.0
+    DECK_THICKNESS_MAX_MM = 1000.0
+    # Fixed reference thickness used ONLY to derive the drawing scale, so the
+    # scale (px per mm) can never depend on the edited deck thickness.
+    DECK_THICKNESS_SCALE_REF_MM = 200.0
+    # Visual-only minimum deck height in screen pixels (never stored in params).
+    MIN_DECK_VISUAL_PX = 6.0
+
+    # In-place editor limits, in the *input field* unit (param_key -> (min, max, unit)).
+    # Carriageway Width keeps its own clamp (4.25 - 23.6 m) in _finish_dimension_edit.
+    EDITABLE_DIMENSION_LIMITS = {
+        "deck_thickness": (DECK_THICKNESS_MIN_MM, DECK_THICKNESS_MAX_MM, "mm"),
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.show_dimensions = True
@@ -328,6 +345,8 @@ class CrossSectionCADWidget(QWidget):
         avail_base_w = base_w - 2 * margin_x
         avail_base_h = base_h - 2 * margin_y - 80
         
+        total_deck_width = max(total_deck_width, 1e-9)
+        model_h = max(model_h, 1e-9)
         base_scale_x = avail_base_w / total_deck_width
         base_scale_y = avail_base_h / model_h
         base_scale = min(base_scale_x, base_scale_y)
@@ -364,10 +383,34 @@ class CrossSectionCADWidget(QWidget):
         """Return model height in mm used for cross-section scaling."""
         return (
             self.girder['depth'] * self.girder_visual_scale['depth']
-            + self.params['deck_thickness']
+            + self.DECK_THICKNESS_SCALE_REF_MM   # fixed ref: scale must not depend on deck thickness
             + self.params['footpath_thickness']
             + 800
         )
+
+    def _deck_thickness_visual_px(self, scale):
+        """Deck thickness in pixels used for DRAWING only.
+
+        The actual value stays in self.params['deck_thickness'] (mm).  Here it is
+        converted to pixels, bounded below by MIN_DECK_VISUAL_PX so a very thin
+        deck stays identifiable, and above by DECK_THICKNESS_MAX_MM so an
+        out-of-range value from elsewhere cannot push the bridge off the canvas.
+        """
+        try:
+            t_mm = float(self.params.get('deck_thickness', self.DECK_THICKNESS_SCALE_REF_MM))
+        except (TypeError, ValueError):
+            t_mm = self.DECK_THICKNESS_SCALE_REF_MM
+        if not math.isfinite(t_mm) or t_mm <= 0:
+            t_mm = self.DECK_THICKNESS_SCALE_REF_MM
+        if not math.isfinite(scale) or scale <= 0:
+            return self.MIN_DECK_VISUAL_PX
+        t_mm = min(t_mm, self.DECK_THICKNESS_MAX_MM)
+        return max(t_mm * scale, self.MIN_DECK_VISUAL_PX)
+
+    @staticmethod
+    def _format_mm(value):
+        """Format a mm value without hiding fractions (200 -> '200', 1.5 -> '1.5')."""
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
 
     def _compute_non_preview_canvas(self):
         """Return non-preview canvas dimensions and margins."""
@@ -515,10 +558,33 @@ class CrossSectionCADWidget(QWidget):
         super().resizeEvent(event)
         self._position_zoom_buttons()
     
+    def _sanitize_params(self, params: dict):
+        """Return a copy of params without values that would corrupt the drawing.
+
+        An invalid deck thickness (non-numeric, NaN, infinite, zero, negative)
+        is dropped so the last valid actual value is kept.  Valid values are
+        stored unchanged - the visual minimum is applied only while painting.
+        """
+        clean = dict(params)
+        if "deck_thickness" in clean:
+            try:
+                t = float(clean["deck_thickness"])
+            except (TypeError, ValueError):
+                t = float("nan")
+            if not math.isfinite(t) or t <= 0:
+                del clean["deck_thickness"]
+            else:
+                clean["deck_thickness"] = t
+        return clean
+
     def update_params(self, params: dict):
-        # Changing deck thickness must not change the horizontal CAD scale.
-        # The saved height is converted back to a scale using model height;
-        # adjust it proportionally so the scale remains constant after edits.
+        params = self._sanitize_params(params)
+
+        # The model height used for scaling no longer contains the deck
+        # thickness, so a deck-only change leaves scale == saved height / model
+        # height untouched.  The proportional adjustment below is kept for the
+        # case where other height-affecting values (e.g. footpath thickness)
+        # arrive in the same update, exactly as before.
         old_model_height = self._compute_model_height_mm()
         old_saved_height = self._saved_cad_height_px
 
@@ -731,12 +797,22 @@ class CrossSectionCADWidget(QWidget):
         editor.setGeometry(rect.toAlignedRect().adjusted(-2, -2, 2, 2))
         editor.setAlignment(Qt.AlignCenter)
         editor.setText(f"{current_value:.3f}".rstrip("0").rstrip("."))
-        editor.setValidator(QDoubleValidator(0.001, 100000.0, 3, editor))
+        # Permissive validator: out-of-range text must still reach
+        # _finish_dimension_edit (editingFinished is not emitted for text the
+        # validator does not accept), where it is rejected with a message.
+        editor.setValidator(QDoubleValidator(-1.0e9, 1.0e9, 3, editor))
         editor.setStyleSheet(
             "QLineEdit { background: white; color: #111; "
             "border: 2px solid #2D7FF9; border-radius: 3px; padding: 2px; }"
         )
-        editor.setToolTip("Enter a positive value and press Enter.")
+        limits = self.EDITABLE_DIMENSION_LIMITS.get(param_key)
+        if limits is not None:
+            editor.setToolTip(
+                f"Enter a value from {self._format_mm(limits[0])} to "
+                f"{self._format_mm(limits[1])} {limits[2]} and press Enter."
+            )
+        else:
+            editor.setToolTip("Enter a positive value and press Enter.")
         self._active_dimension = (param_key, input_key, unit_factor)
         self._dimension_editor = editor
         editor.editingFinished.connect(self._finish_dimension_edit)
@@ -754,10 +830,21 @@ class CrossSectionCADWidget(QWidget):
 
         text = editor.text().strip()
         param_key, input_key, unit_factor = active
+        reject_message = "Enter a valid positive number."
+        editor_center = editor.geometry().center()
 
         try:
             value = float(text)
             if not math.isfinite(value) or value <= 0:
+                raise ValueError
+
+            # Per-dimension engineering range (e.g. Deck Thickness).
+            limits = self.EDITABLE_DIMENSION_LIMITS.get(param_key)
+            if limits is not None and not (limits[0] <= value <= limits[1]):
+                reject_message = (
+                    f"Value must be between {self._format_mm(limits[0])} and "
+                    f"{self._format_mm(limits[1])} {limits[2]}."
+                )
                 raise ValueError
 
             # Carriageway Width is specified per carriageway (metres).
@@ -773,6 +860,8 @@ class CrossSectionCADWidget(QWidget):
         editor.deleteLater()
 
         if value is None:
+            # Rejected: keep the previous value, show why.
+            QToolTip.showText(self.mapToGlobal(editor_center), reject_message, self)
             self.setFocus()
             return
 
@@ -1651,10 +1740,11 @@ class CrossSectionCADWidget(QWidget):
         margin_x = 10 if is_preview else 80
         margin_y = 10 if is_preview else 80
         
-        scale_x = (width - 2 * margin_x) / total_deck_width
+        scale_x = (width - 2 * margin_x) / max(total_deck_width, 1e-9)
         extra_dim_space = 800 if self.show_dimensions else 0
+        # Fixed reference deck thickness: the scale must not depend on the edited deck value.
         scale_y = (height - 2 * margin_y - (40 if is_preview else 80)) / (self.girder['depth'] * self.girder_visual_scale['depth'] +
-                                                self.params['deck_thickness'] +
+                                                self.DECK_THICKNESS_SCALE_REF_MM +
                                                 self.params['footpath_thickness'] + extra_dim_space)
         
         if is_preview:
@@ -1667,14 +1757,19 @@ class CrossSectionCADWidget(QWidget):
         
         # Apply scale factor for size adjustment (zoom_level already applied to width/height)
         scale = scale * self.scale_factor
-        
+        if not math.isfinite(scale) or scale <= 0:
+            scale = 1e-6   # never divide by / multiply with an invalid scale
+
+        # Deck thickness for DRAWING (>= MIN_DECK_VISUAL_PX); the real value stays in params.
+        deck_thick_px = self._deck_thickness_visual_px(scale)
+
         DIM_OFFSET = 510 * scale
         DIM_OFFSET_SMALL = 588 * scale
 
         center_x = self.width() / 2
         # Position bridge in the center vertically
         total_bridge_height = (self.girder['depth'] * scale * self.girder_visual_scale['depth'] +
-                              self.params['deck_thickness'] * scale +
+                              deck_thick_px +
                               self.params['footpath_thickness'] * scale +
                               self.crash_barrier['height'] * scale + 
                               self.railing['height'] * scale)
@@ -1688,7 +1783,6 @@ class CrossSectionCADWidget(QWidget):
 
         girder_depth_visual = self.girder['depth'] * scale * self.girder_visual_scale['depth']
         girder_top_y = base_y - girder_depth_visual
-        deck_thick_px = self.params['deck_thickness'] * scale
         fp_thick_px = self.params['footpath_thickness'] * scale
         deck_bottom_y = girder_top_y
         deck_top_y = deck_bottom_y - deck_thick_px
@@ -2154,7 +2248,7 @@ class CrossSectionCADWidget(QWidget):
         """Add organized dimension lines with extension lines - with median support"""
         
         fp_thick_px = self.params['footpath_thickness'] * scale
-        deck_thick_px = self.params['deck_thickness'] * scale
+        deck_thick_px = self._deck_thickness_visual_px(scale)   # visual height (>= minimum)
         
         # Calculate barrier positions if not passed
         if crash_barrier_width_px is None:
@@ -2371,7 +2465,9 @@ class CrossSectionCADWidget(QWidget):
         else:
             deck_center_x = (deck_slab_left + deck_slab_right) / 2
 
-        if deck_thick_px > 5:
+        # Always drawn: the visual height is never below MIN_DECK_VISUAL_PX, so the
+        # annotation, label and edit hit-box cannot vanish for thin decks.
+        if deck_thick_px > 0:
             local_deck_top_y = deck_top_y + self._compute_slope_offset(
                 deck_center_x, carriageway_start_x, carriageway_end_x
             )
@@ -2407,7 +2503,7 @@ class CrossSectionCADWidget(QWidget):
             # Renamed to "Deck Thickness"
             text = "Deck Thickness"
             if self.show_carriageway_values:
-                text += f" = {deck_t_mm:.0f} mm"
+                text += f" = {self._format_mm(deck_t_mm)} mm"
             font = QFont('Arial', 9, QFont.Normal)
             painter.setFont(font)
             metrics = painter.fontMetrics()
