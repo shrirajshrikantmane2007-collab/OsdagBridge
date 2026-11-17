@@ -1,4 +1,4 @@
-import os, yaml
+import os, yaml, math, traceback
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QMenuBar, QSplitter, QSizePolicy, QPushButton, QLineEdit, QComboBox, QFileDialog,
@@ -782,13 +782,160 @@ class CustomWindow(QWidget):
 
     #-------Common-Design-Save-Additional-Inputs-Functionality-END---------
 
+    # Top-view dimensionEdited emits CAD parameter names (value in metres);
+    # cross-section emits the Input Dock key directly. Every editable dimension's
+    # emitted value is already in Input Dock units, so no conversion is applied.
+    _CAD_PARAM_TO_INPUT_KEY = {
+        "span_length": KEY_SPAN,
+        "girder_spacing": KEY_TS_GIRDER_SPACING,
+    }
+    _CAD_EDITABLE_INPUT_KEYS = (
+        KEY_SPAN,                # m  (top view)
+        KEY_TS_GIRDER_SPACING,   # m  (top view and cross section)
+        KEY_CARRIAGEWAY_WIDTH,   # m  (cross section)
+        KEY_TS_DECK_THICKNESS,   # mm (cross section)
+    )
+
     def setup_cad_connections(self):
         """Connect input dock field changes to CAD widget for real-time updates"""
         # Connect to input dock's value changed signals
         # This will update the CAD whenever any input field changes
         if hasattr(self.input_dock, 'input_value_changed'):
             self.input_dock.input_value_changed.connect(self.update_cad_from_inputs)        
-            
+
+        # CAD -> Input Dock: edits made by double-clicking a dimension in either view.
+        # Guarded so repeated calls cannot connect the handler twice.
+        if not getattr(self, "_cad_dimension_connected", False):
+            self.cad_comp_widget.dimensionEdited.connect(self._on_cad_dimension_edited)
+            self._cad_dimension_connected = True
+
+    def _revert_cad_to_inputs(self):
+        """Force both CAD views back to input_dict (after a rejected/failed CAD edit)."""
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict, force=True)
+
+    def _reject_cad_edit(self, input_key: str, message: str):
+        """Report a rejected CAD edit and restore both views from input_dict."""
+        print(f"[ERROR]: CAD dimension edit rejected for '{input_key}': {message}")
+        CustomMessageBox(
+            title="Invalid Dimension",
+            text=message,
+            dialogType=MessageBoxType.Warning
+        ).exec()
+        self._revert_cad_to_inputs()
+
+    def _read_float_input(self, key):
+        """input_dict[key] as a finite float, or None if unset / empty / not numeric."""
+        value = self.input_dict.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _validate_girder_spacing_edit(self, spacing_m: float):
+        """
+        Check a Girder Spacing edit (metres) against the geometry actually drawn,
+        BEFORE input_dict or the Input Dock are touched. Returns (ok, message).
+
+        Rule (from the CAD's own layout): the girder group, (n - 1) * spacing,
+        must fit on the deck with each girder's top flange on the deck. Deck width
+        is the cross section's compute_deck_total_width() (carriageway, median,
+        footpaths, barriers, railings).
+        """
+        if self._read_float_input(KEY_CARRIAGEWAY_WIDTH) is None:
+            return False, (
+                "Girder Spacing depends on the deck width, which is set by the "
+                "Carriageway Width. Enter the Carriageway Width in the Input Dock first."
+            )
+
+        # The number of girders is a derived value: make sure it is up to date.
+        if self.input_dock.is_require_field_changed:
+            solve_extend_basic_input_dict(self.input_dict)
+            self.input_dock.is_require_field_changed = False
+            # Bring the CAD widgets in line with the freshly solved geometry.
+            self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
+        n_girders = self._read_float_input(KEY_TS_NO_OF_GIRDERS)
+        if n_girders is None:
+            return False, (
+                "The number of girders has not been determined yet, so Girder "
+                "Spacing cannot be checked. Complete the basic inputs first."
+            )
+        n = int(n_girders)
+        if n <= 1:
+            return True, None   # a single girder has no spacing to constrain
+
+        deck_mm, flange_mm = self.cad_comp_widget.get_deck_geometry_mm()
+        usable_mm = deck_mm - flange_mm
+        group_mm = (n - 1) * spacing_m * 1000.0
+        if usable_mm <= 0 or group_mm > usable_mm:
+            max_m = max(usable_mm, 0.0) / (n - 1) / 1000.0
+            return False, (
+                f"Girder Spacing of {spacing_m:g} m is too large: {n} girders at this "
+                f"spacing span {group_mm / 1000.0:.2f} m, but only "
+                f"{max(usable_mm, 0.0) / 1000.0:.2f} m of the {deck_mm / 1000.0:.2f} m "
+                f"deck is available for the girder group. "
+                f"Maximum Girder Spacing is {max_m:.2f} m."
+            )
+        return True, None
+
+    def _on_cad_dimension_edited(self, dimension_key: str, value: float):
+        """
+        Handle a dimension edited in Cross Section / Top View.
+        Any failure is reported (log + message box) and both views are restored
+        from input_dict, so an edit never appears to succeed when it did not.
+        """
+        try:
+            self._apply_cad_dimension_edit(dimension_key, value)
+        except Exception as e:
+            traceback.print_exc()
+            self._reject_cad_edit(
+                str(dimension_key),
+                f"Could not apply the dimension edit: {e}"
+            )
+
+    def _apply_cad_dimension_edit(self, dimension_key: str, value: float):
+        """
+        Updates the Input Dock field (or input_dict directly for values that have
+        no dock widget), re-solves derived values in the existing order, then
+        refreshes both CAD views from input_dict.
+        """
+        input_key = self._CAD_PARAM_TO_INPUT_KEY.get(dimension_key, dimension_key)
+        if input_key not in self._CAD_EDITABLE_INPUT_KEYS:
+            self._reject_cad_edit(
+                input_key, f"Unmapped CAD dimension '{dimension_key}' (value {value})."
+            )
+            return
+
+        # Dependent check first: nothing is modified if the edit is invalid.
+        if input_key == KEY_TS_GIRDER_SPACING:
+            ok, message = self._validate_girder_spacing_edit(float(value))
+            if not ok:
+                self._reject_cad_edit(input_key, message)
+                return
+
+        if self.input_dock._w(input_key) is not None:
+            # Independent user input with an Input Dock field: same path as a manual edit
+            # (validation, is_require_field_changed), then the normal refresh, which
+            # re-solves derived values when a required field changed.
+            ok, message = self.input_dock.set_field_value(input_key, value)
+            if not ok:
+                self._reject_cad_edit(input_key, message)
+                return
+            self.update_cad_from_inputs()
+            return
+
+        # No Input Dock widget: the value lives only in input_dict (solver-derived).
+        # Run any pending solve FIRST so it cannot overwrite the edited value, then
+        # write the edit and clear the flag so the refresh does not re-solve over it.
+        if self.input_dock.is_require_field_changed:
+            solve_extend_basic_input_dict(self.input_dict)
+            self.input_dock.is_require_field_changed = False
+        self.input_dict[input_key] = float(value)
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
     # Function for saving input dictionary into an OSI file
     def saveOSI_inputs(self):
         # Populate additional input defaults so they appear in the saved file

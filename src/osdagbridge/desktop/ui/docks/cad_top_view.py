@@ -5,9 +5,14 @@ Author: Arushi
 """
 from osdagbridge.core.utils.common import *
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon
+from PySide6.QtWidgets import (
+    QWidget, QPushButton, QScrollArea, QLineEdit, QMessageBox
+)
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal
+from PySide6.QtGui import (
+    QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon,
+    QDoubleValidator
+)
 from .cad_cross_section import CrossSectionCADWidget
 
 # ---- CAD Grey Palette ----
@@ -25,9 +30,25 @@ DIM_STACK_GAP = 28         # vertical gap between stacked dimensions
 LEADER_TEXT_OFFSET = 25    # leader label distance
 
 
+class _DimensionLineEdit(QLineEdit):
+    """Inline editor used for editable top-view dimensions."""
+
+    cancelRequested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.cancelRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class TopViewCADWidget(QWidget):
-    """Widget for drawing bridge top view"""
-    
+    """Widget for drawing bridge top view."""
+
+    # Emits (parameter_name, value_in_metres) after a valid inline edit.
+    dimensionEdited = Signal(str, float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.show_dimensions = True
@@ -68,6 +89,25 @@ class TopViewCADWidget(QWidget):
             'median_present': False,
             KEY_MD_WIDTH: 1200,
         }
+
+        # Editable dimension labels are rebuilt on every paint.
+        self.editable_dimensions = []
+        self._active_dimension = None
+        self._dimension_editor = _DimensionLineEdit(self)
+        self._dimension_editor.setAlignment(Qt.AlignCenter)
+        self._dimension_editor.setStyleSheet("""
+            QLineEdit {
+                background: #fffde7;
+                color: #111;
+                border: 1px solid #3978c5;
+                border-radius: 3px;
+                padding: 2px 5px;
+                font: 9pt Arial;
+            }
+        """)
+        self._dimension_editor.editingFinished.connect(self._finish_dimension_edit)
+        self._dimension_editor.cancelRequested.connect(self._cancel_dimension_edit)
+        self._dimension_editor.hide()
         
         # girder dimensions (mm)
         self.girder = {
@@ -455,13 +495,122 @@ class TopViewCADWidget(QWidget):
         if "span_length" in params:
             self.show_span_values = True
 
-        if "carriageway_width" in params:
+        if "carriageway_width" in params or "girder_spacing" in params:
             self.show_carriageway_values = True
 
         self.show_dimensions = True
         self.zoom_reset() # Auto-fit height on parameter change
         self.update()
     
+    def _text_background_rect(self, painter, x, y, text, font_size=9):
+        """Return the same rectangle used by draw_text_with_background()."""
+        painter.save()
+        painter.setFont(QFont('Arial', font_size, QFont.Normal))
+        metrics = painter.fontMetrics()
+        lines = text.split("\n")
+        line_height = metrics.height()
+        max_width = max(metrics.boundingRect(line).width() for line in lines)
+        total_height = line_height * len(lines)
+        painter.restore()
+
+        padding = 2
+        return QRectF(
+            x - padding,
+            y - total_height - padding,
+            max_width + 2 * padding,
+            total_height + 2 * padding,
+        )
+
+    def _register_editable_dimension(self, rect, parameter_name, display_name):
+        """Register a dimension label as a double-click editing target."""
+        self.editable_dimensions.append({
+            "rect": rect.adjusted(-5, -4, 5, 4),
+            "parameter_name": parameter_name,
+            "display_name": display_name,
+        })
+
+    def _begin_dimension_edit(self, dimension):
+        """Display a QLineEdit over the selected dimension label."""
+        if self._active_dimension is not None:
+            self._cancel_dimension_edit()
+
+        parameter_name = dimension["parameter_name"]
+        current_mm = float(self.params.get(parameter_name, 0))
+        if not math.isfinite(current_mm) or current_mm <= 0:
+            return
+
+        editor = self._dimension_editor
+        validator = QDoubleValidator(0.001, 100000.0, 3, editor)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        editor.setValidator(validator)
+        editor.setToolTip(f"Enter {dimension['display_name']} in metres. Value must be greater than zero.")
+        editor.setText(f"{current_mm / 1000.0:.3f}".rstrip("0").rstrip("."))
+
+        label_rect = dimension["rect"]
+        editor_width = max(125, int(label_rect.width()) + 28)
+        editor_height = 27
+        x = int(label_rect.center().x() - editor_width / 2)
+        y = int(label_rect.center().y() - editor_height / 2)
+        x = max(2, min(x, self.width() - editor_width - 2))
+        y = max(2, min(y, self.height() - editor_height - 2))
+
+        editor.setGeometry(x, y, editor_width, editor_height)
+        self._active_dimension = dict(dimension)
+        editor.show()
+        editor.raise_()
+        editor.setFocus(Qt.MouseFocusReason)
+        editor.selectAll()
+
+    def _finish_dimension_edit(self):
+        """Validate the edited metre value and update the CAD model in mm."""
+        if self._active_dimension is None:
+            return
+
+        raw_value = self._dimension_editor.text().strip()
+        try:
+            value_m = float(raw_value)
+        except (TypeError, ValueError):
+            value_m = float("nan")
+
+        if not math.isfinite(value_m) or value_m <= 0 or value_m > 100000.0:
+            QMessageBox.warning(
+                self,
+                "Invalid Dimension",
+                "Enter a valid positive number in metres. The value must be greater than 0 and no more than 100000 m.",
+            )
+            self._dimension_editor.setFocus(Qt.OtherFocusReason)
+            self._dimension_editor.selectAll()
+            return
+
+        dimension = self._active_dimension
+        parameter_name = dimension["parameter_name"]
+        value_mm = int(round(value_m * 1000.0))
+
+        self._active_dimension = None
+        self._dimension_editor.hide()
+
+        # update_params() redraws the existing CAD using the new geometry.
+        self.update_params({parameter_name: value_mm})
+
+        # The parent view can use this signal to synchronize the main form/input_dict.
+        # The emitted key is the CAD parameter name and the emitted value is in metres.
+        self.dimensionEdited.emit(parameter_name, value_mm / 1000.0)
+
+    def _cancel_dimension_edit(self):
+        """Close the inline editor without changing the CAD parameters."""
+        self._active_dimension = None
+        self._dimension_editor.hide()
+
+    def mouseDoubleClickEvent(self, event):
+        """Open inline editing when an editable dimension label is double-clicked."""
+        position = event.position() if hasattr(event, "position") else event.pos()
+        for dimension in reversed(self.editable_dimensions):
+            if dimension["rect"].contains(position):
+                self._begin_dimension_edit(dimension)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
         """Handle mouse hover for top view"""
         pos = event.position() if hasattr(event, 'position') else event.pos()
@@ -478,8 +627,9 @@ class TopViewCADWidget(QWidget):
             self.update()
 
     def paintEvent(self, event):
-        # clear hover zones at start of each paint
+        # Clear interaction zones at the start of each paint.
         self.top_view_hover_zones = []
+        self.editable_dimensions = []
         
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -1299,7 +1449,8 @@ class TopViewCADWidget(QWidget):
         
         self.draw_dimension_arrow_with_extensions_up(
             painter, x1_span, dim_y2, x2_span, dim_y2,
-            label_span, last_girder_y
+            label_span, last_girder_y,
+            editable_dimension=("span_length", "Span Length"),
         )
 
         # GIRDER SPACING dimension (always visible)
@@ -1335,6 +1486,11 @@ class TopViewCADWidget(QWidget):
                 label_text,
                 QColor(255, 255, 255, 240),
                 QColor(0, 0, 0), 9, False
+            )
+            self._register_editable_dimension(
+                self._text_background_rect(painter, label_x, label_y, label_text, 9),
+                "girder_spacing",
+                "Girder Spacing",
             )
 
         # CL OF BEARING labels - ALWAYS VISIBLE (moved outside hover condition)
@@ -1410,7 +1566,9 @@ class TopViewCADWidget(QWidget):
             self.draw_clean_leader_line(painter, target_x, target_y, label_x, label_y,
                                     "End Diaphragm", CAD_DARK_GREY, QColor(139, 69, 19))
 
-    def draw_dimension_arrow_with_extensions_up(self, painter, x1, y1, x2, y2, text, girder_y):
+    def draw_dimension_arrow_with_extensions_up(
+        self, painter, x1, y1, x2, y2, text, girder_y, editable_dimension=None
+    ):
         """Dimension line with arrows and extension lines going UP to girder level (dimension below)"""
         painter.setPen(QPen(QColor(0, 0, 0), 1.0))
         
@@ -1461,8 +1619,19 @@ class TopViewCADWidget(QWidget):
         metrics = painter.fontMetrics()
         text_width = metrics.boundingRect(text).width()
         
-        self.draw_text_with_background(painter, text_x - text_width/2, text_y, text, 
-                                    QColor(255, 255, 255, 240), QColor(0, 0, 0), 9, False)
+        text_left = text_x - text_width / 2
+        self.draw_text_with_background(
+            painter, text_left, text_y, text,
+            QColor(255, 255, 255, 240), QColor(0, 0, 0), 9, False
+        )
+
+        if editable_dimension is not None:
+            parameter_name, display_name = editable_dimension
+            self._register_editable_dimension(
+                self._text_background_rect(painter, text_left, text_y, text, 9),
+                parameter_name,
+                display_name,
+            )
 
 
     def draw_skewed_dimension_arrow(self, painter, x1, y1, x2, y2, text, skew_rad):

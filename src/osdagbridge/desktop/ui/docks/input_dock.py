@@ -1045,6 +1045,78 @@ class InputDock(QWidget):
         else:
             print("[ERROR]: template_page.input_dictionary Not Found")
 
+    @staticmethod
+    def _format_field_value(value) -> str:
+        """Text form of a programmatic value (no trailing zeros, e.g. 2.750 -> '2.75')."""
+        if isinstance(value, float):
+            return format(round(value, 6), "f").rstrip("0").rstrip(".")
+        return str(value)
+
+    def set_field_value(self, key: str, value, emit_signal: bool = False):
+        """
+        Programmatically set an existing Input Dock field and its entry in the
+        parent's canonical input_dict (no second copy of state is kept).
+
+        - Widget signals are blocked, so the textChanged / editingFinished /
+          currentTextChanged callbacks do not fire (no recursion).
+        - QLineEdit values go through the same hard validation as manual edits;
+          on failure the widget and input_dict are restored and the validator's
+          message is returned.
+        - QComboBox values must already be one of the combo's items.
+        - emit_signal=False by default: the caller refreshes the CAD explicitly.
+
+        Returns (ok, message). message is None on success.
+        """
+        widget = self._w(key)
+        if not isinstance(widget, (QLineEdit, QComboBox)):
+            return False, f"No editable Input Dock field for key '{key}'."
+        if value is None or not hasattr(self.parent, "input_dict"):
+            return False, f"Cannot set '{key}': no value or no parent input_dict."
+
+        text = self._format_field_value(value)
+        input_dict = self.parent.input_dict
+
+        # Snapshot for rollback
+        had_key = key in input_dict
+        old_dict_value = input_dict.get(key)
+        old_text = self._text(key)
+
+        if isinstance(widget, QComboBox):
+            if widget.findText(text) < 0:
+                return False, f"'{text}' is not an option for '{key}'."
+            self._set_combo_silently(widget, text)
+        else:
+            blocked = widget.blockSignals(True)
+            try:
+                widget.setText(text)
+            finally:
+                widget.blockSignals(blocked)
+
+        self.reset_error_state(widget)
+        self._update_input_dict(key, text)
+
+        # Same hard validation as a manual QLineEdit edit (combos are always valid)
+        if isinstance(widget, QLineEdit):
+            result = self.validator.validate_basic_inputs(key, input_dict)
+            if result is not None:
+                _, message = result
+                blocked = widget.blockSignals(True)
+                try:
+                    widget.setText(old_text)
+                finally:
+                    widget.blockSignals(blocked)
+                if had_key:
+                    input_dict[key] = old_dict_value
+                else:
+                    input_dict.pop(key, None)
+                return False, message
+
+        if self._is_require_field(key):
+            self.is_require_field_changed = True
+        if emit_signal:
+            self.input_value_changed.emit()
+        return True, None
+
     def populate_from_dict(self, data: dict) -> None:
         """
         Push all values from *data* into the input dock widgets and parent.input_dict.

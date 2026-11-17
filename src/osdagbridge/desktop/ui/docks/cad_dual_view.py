@@ -5,7 +5,7 @@ Author: Arushi
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter, QScrollArea, QHBoxLayout, QPushButton, QLabel
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal
 from .cad_cross_section import CrossSectionCADWidget
 from .cad_top_view import TopViewCADWidget
 from osdagbridge.core.utils.common import *
@@ -17,7 +17,13 @@ from osdagbridge.desktop.cad.irc5_geometry import (
 
 class BridgeDualCADWidget(QWidget):
     """Split view widget showing both cross-section and top view with individual controls"""
-    
+
+    # Forwarded unchanged from the child CAD widgets' ``dimensionEdited`` signals.
+    #   cross section -> (input_key, value)      value already in Input Dock units
+    #   top view      -> (cad_param_name, value) value in metres
+    # The two children use different key spaces; the main window interprets them.
+    dimensionEdited = Signal(str, float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cross_zoom_level = 1.0
@@ -70,6 +76,11 @@ class BridgeDualCADWidget(QWidget):
         self.top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         
         self.splitter.addWidget(self.top_scroll)
+
+        # Forward dimension edits from both child widgets. Done once, right after
+        # the children are created (setup_ui runs only from __init__).
+        self.cross_section_widget.dimensionEdited.connect(self.dimensionEdited)
+        self.top_view_widget.dimensionEdited.connect(self.dimensionEdited)
         
         # Set equal sizes for both views
         self.splitter.setStretchFactor(0, 1)
@@ -147,15 +158,32 @@ class BridgeDualCADWidget(QWidget):
         )
         self.top_view_widget.update()
     
-    def update_from_osdag_inputs(self, input_dict):
+    def get_deck_geometry_mm(self):
+        """
+        Read-only geometry as currently drawn by the cross section:
+        (total deck width, girder top-flange width), both in mm.
+        Uses the cross-section widget's own compute_deck_total_width(), so the
+        result matches the drawing (median, footpaths, barriers, railings).
+        """
+        deck_width_mm, _ = self.cross_section_widget.compute_deck_total_width()
+        girder = getattr(self.cross_section_widget, "girder", None) or {}
+        flange_mm = float(girder.get("top_flange_width", 0) or 0)
+        return float(deck_width_mm), flange_mm
+
+    def update_from_osdag_inputs(self, input_dict, force=False):
         """
         Update CAD from OsdagBridge input fields
         Maps from OsdagBridge common.py KEY_* fields to CAD widget parameters
         
         Args:
             input_dict: Dictionary with keys from common.py (e.g., KEY_SPAN, KEY_CARRIAGEWAY_WIDTH)
+            force: Push every mapped value to both views even if unchanged since the
+                   last push. Used to roll a view back after a CAD edit was rejected
+                   (the child already applied its own, now-invalid value locally).
         """
-        
+        if force:
+            self._last_mapped_params = {}
+
         params = {}
         
         # Map span (meters to mm)
@@ -337,4 +365,3 @@ class BridgeDualCADWidget(QWidget):
         if cross_section_params:
             self.cross_section_widget.update_params(cross_section_params)
         self.top_view_widget.update_params(changed_params)
-        
