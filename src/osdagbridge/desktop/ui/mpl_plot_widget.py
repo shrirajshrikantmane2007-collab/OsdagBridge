@@ -22,6 +22,7 @@ from osdagbridge.core.bridge_types.plate_girder.plot_generator import (
     build_figure_bmd,
     build_figure_deflection,
     build_figure_grillage,
+    build_transverse_catalog,
     _add_node_number_labels,
     _add_element_number_labels,
     FORCE_MAP,
@@ -174,6 +175,8 @@ class MplPlotWidget(QWidget):
         self._edge_dist = 0.0
         self._output_dock = None
         self._summary_data = {}
+        # {label: {"label", "kind", "elements"}} - end diaphragms / cross bracings
+        self._transverse = {}
 
         # Display States
         self._grillage_mode = False
@@ -339,6 +342,7 @@ class MplPlotWidget(QWidget):
         self._loadcases = []
         self._nodes     = {}
         self._members   = {}
+        self._transverse = {}
         self._output_dock = None
         self._summary_data = {}
         self._cb_max = None
@@ -375,6 +379,13 @@ class MplPlotWidget(QWidget):
                 combo_member.currentTextChanged.disconnect(self.update_plot)
             except RuntimeError:
                 pass
+            # Remove the transverse entries this widget added in link_output_dock().
+            combo_member.blockSignals(True)
+            for label in self._transverse:
+                idx = combo_member.findText(label)
+                if idx >= 0:
+                    combo_member.removeItem(idx)
+            combo_member.blockSignals(False)
 
         for rb in self._output_dock.output_widget.findChildren(CustomRadioButton):
             if rb.text() in _RICH_LABEL_TO_FORCE:
@@ -413,6 +424,7 @@ class MplPlotWidget(QWidget):
         self._nodes     = nodes
         self._members   = members
         self._edge_dist = edge_dist
+        self._transverse = build_transverse_catalog(nodes, members, edge_dist)
 
         if hasattr(self, '_fig') and self._fig.axes:
             ax = self._fig.axes[0]
@@ -449,6 +461,12 @@ class MplPlotWidget(QWidget):
         # Connect Analysis Member Dropdown
         combo_member = output_dock.output_widget.findChild(QComboBox, "analysis.member")
         if combo_member is not None:
+            # Offer transverse members (end diaphragms / cross bracings) next to the girders
+            combo_member.blockSignals(True)
+            for label in self._transverse:
+                if combo_member.findText(label) < 0:
+                    combo_member.addItem(label)
+            combo_member.blockSignals(False)
             combo_member.currentTextChanged.connect(self.update_plot)
             # Make sure it fires an update if changed from UI, since grillage might be active
             combo_member.currentTextChanged.connect(lambda text: self._on_grillage_toggled(self._grillage_mode) if self._grillage_mode else None)
@@ -518,6 +536,7 @@ class MplPlotWidget(QWidget):
         loadcase  = self._current_loadcase()
         force_key = self._current_force_key()
         sel_girder= self._current_member()
+        transverse = self._transverse.get(sel_girder)   # None for "All" / girders
 
         if not loadcase or not force_key:
             return
@@ -542,19 +561,19 @@ class MplPlotWidget(QWidget):
             self._fig, self._summary_data = build_figure_sfd(
                 ds, force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
-                selected_girder=sel_girder
+                selected_girder=sel_girder, transverse=transverse
             )
         elif force_key in _DEFL_KEYS:
             self._fig, self._summary_data = build_figure_deflection(
                 ds, force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
-                selected_girder=sel_girder
+                selected_girder=sel_girder, transverse=transverse
             )
         else:
             self._fig, self._summary_data = build_figure_bmd(
                 ds, force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
-                selected_girder=sel_girder
+                selected_girder=sel_girder, transverse=transverse
             )
 
         self._attach_figure(self._fig)
@@ -716,6 +735,8 @@ class MplPlotWidget(QWidget):
                 old_azim = self._fig.axes[0].azim
             plt.close(self._fig)
             sel_girder = self._current_member()
+            if sel_girder in self._transverse:
+                sel_girder = "All"   # grillage view has no transverse-member filter
             self._fig = build_figure_grillage(self._nodes, self._members, edge_dist=self._edge_dist, selected_girder=sel_girder)
             self._attach_figure(self._fig)
             if self._fig.axes and old_elev is not None and old_azim is not None:

@@ -123,6 +123,114 @@ def _find_girders(nodes, members, z_tol=3):
     return dict(sorted(girders.items()))
 
 
+# =============================================================================
+# TRANSVERSE MEMBERS (end diaphragms / cross bracings)
+# =============================================================================
+
+def _transverse_view(nodes, members, elems):
+    """
+    Re-express ONE transverse member as a 'girder' so the existing SFD / BMD /
+    deflection builders can plot it unchanged.
+
+    The returned node/member dicts keep the ORIGINAL node and element tags (so
+    ds["forces"] / ds["displacements"] lookups hit the real elements/nodes) and
+    only change coordinates:  x' = +/- z (position along the member),
+    z' = constant (member station).  _find_girders() then sees a single line.
+    Raises ValueError if the elements are not one contiguous, consistently
+    oriented chain (the i->j axis of the results would be ambiguous).
+    """
+    signs = set()
+    for e in elems:
+        n1, n2 = members[e]
+        dz = nodes[n2][2] - nodes[n1][2]
+        signs.add(1.0 if dz > 0 else -1.0)
+    if len(signs) != 1:
+        raise ValueError("transverse member has mixed element orientation")
+    s = signs.pop()
+
+    ordered = sorted(elems, key=lambda e: s * nodes[members[e][0]][2])
+    for a, b in zip(ordered, ordered[1:]):
+        if members[a][1] != members[b][0]:
+            raise ValueError("transverse member elements are not contiguous")
+
+    used = {n for e in ordered for n in members[e]}
+    station = sum(nodes[n][0] for n in used) / len(used)
+    nodes_t = {n: [s * nodes[n][2], nodes[n][1], station] for n in used}
+    members_t = {e: list(members[e]) for e in ordered}
+    return nodes_t, members_t
+
+
+def build_transverse_catalog(nodes, members, edge_dist=0.0, tol=1e-2):
+    """
+    Classify transverse elements of the live model into selectable members.
+
+    Returns {label: {"label", "kind", "elements"}} with:
+      * "End Diaphragm 1/2" - connected transverse line touching the first / last
+        X of the bridge (same end-line test as _add_grillage_background); the
+        whole line is included.
+      * "Cross Bracing N"   - every other transverse line, ordered by X, restricted
+        (as results_data_post_processing.build_crossbracings does) to elements
+        whose both end nodes lie on main girders (overhang elements dropped).
+        One entry per line - the bracing is a single transverse component.
+    Longitudinal = elements whose end nodes share the same rounded Z, i.e. exactly
+    the set _find_girders() uses. With edge_dist > 0 the two outermost longitudinal
+    lines are edge beams, not main girders (same convention as the builders).
+    """
+    lines = list(_find_girders(nodes, members).values())
+    main_lines = lines if edge_dist <= 0 else lines[1:-1]
+    girder_nodes = {n for elems in main_lines for e in elems for n in members[e]}
+    long_set = {e for elems in lines for e in elems}
+    trans = [e for e in members if e not in long_set]
+    if not trans:
+        return {}
+
+    # connected components of transverse elements (shared nodes) = transverse lines
+    parent = {}
+    def find(a):
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for e in trans:
+        n1, n2 = members[e]
+        parent[find(n1)] = find(n2)
+    comps = defaultdict(list)
+    for e in trans:
+        comps[find(members[e][0])].append(e)
+
+    all_x = [c[0] for c in nodes.values()]
+    min_x, max_x = min(all_x), max(all_x)
+
+    ends, mids = [], []
+    for elems in comps.values():
+        ids = {n for e in elems for n in members[e]}
+        mean_x = sum(nodes[n][0] for n in ids) / len(ids)
+        at_min = any(abs(nodes[n][0] - min_x) < tol for n in ids)
+        at_max = any(abs(nodes[n][0] - max_x) < tol for n in ids)
+        if at_min or at_max:
+            ends.append((1 if at_min else 2, elems))
+        else:
+            between = [e for e in elems
+                       if members[e][0] in girder_nodes and members[e][1] in girder_nodes]
+            if between:
+                mids.append((mean_x, between))
+
+    entries = [(f"End Diaphragm {k}", "end_diaphragm", el) for k, el in sorted(ends, key=lambda t: t[0])]
+    entries += [(f"Cross Bracing {i}", "cross_bracing", el)
+                for i, (_, el) in enumerate(sorted(mids, key=lambda t: t[0]), start=1)]
+
+    catalog = {}
+    for label, kind, elems in entries:
+        try:
+            _transverse_view(nodes, members, elems)   # validate once, up front
+        except ValueError as exc:
+            print(f"[WARN] transverse member '{label}' not plottable: {exc}")
+            continue
+        catalog[label] = {"label": label, "kind": kind, "elements": sorted(elems)}
+    return catalog
+
+
 def _build_polyline(elems, members, nodes, force_i, force_j, ds):
     """
     Build arrays (xs, ys, zs, vals, node_ids) for one girder.
@@ -650,13 +758,19 @@ def build_figure_grillage(nodes, members, edge_dist=0.0, selected_girder="All"):
 # SFD PLOT
 # =============================================================================
 
-def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All"):
+def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All", transverse=None):
     """
     Build a 3-D matplotlib figure showing the Shear Force Diagram.
     """
     v_scale = _value_plot_scale(eng_scale)
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     disp_key = FORCE_DISPLAY.get(force_key, force_key)
+    # Transverse member: re-express it as a single girder (original tags kept).
+    t_label = None
+    if transverse is not None:
+        t_label = transverse["label"]
+        nodes, members = _transverse_view(nodes, members, transverse["elements"])
+        edge_dist, selected_girder = 0.0, "All"
     girders = _find_girders(nodes, members)
 
     # Use muted gray/slate for standard non-active node values
@@ -708,7 +822,7 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 
     for i, (z_val, elems) in enumerate(girder_items):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
+        girder_name  = t_label or (f"G{i}" if edge_dist > 0 else f"G{i + 1}")
 
         if selected_girder != "All" and girder_name != selected_girder:
             continue
@@ -854,11 +968,12 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
             timer.add_callback(auto_hide)
             timer.start()
 
-    _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
+    if t_label is None:
+        _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
     _add_node_number_labels(ax, bg_nodes)
     _add_element_number_labels(ax, bg_nodes, bg_members)  # hidden by default; toggled by toolbar
-    ax.set_xlabel("Span Length (m)", fontsize=10, labelpad=8)
-    ax.set_ylabel("Bridge Width (m)", fontsize=10, labelpad=8)
+    ax.set_xlabel("Member Length (m)" if t_label else "Span Length (m)", fontsize=10, labelpad=8)
+    ax.set_ylabel("Span Position (m)" if t_label else "Bridge Width (m)", fontsize=10, labelpad=8)
     ax.set_zlabel(f"{disp_key} (kN)", fontsize=10, labelpad=8)
     _set_value_axis_tick_formatter(ax, v_scale)
     # Keep baseline at 0 and let z-limits expand/shrink with v_scale.
@@ -871,7 +986,7 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     # inside the same cube for different v_scale values.
     ax.set_box_aspect([x_range, z_range, (x_range * 0.30) * max(v_scale, 1e-6)])
     ax.yaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]))
-    ax.set_title(f"Shear Force Diagram  —  {disp_key} (kN)", fontsize=12, fontweight="bold", pad=12)
+    ax.set_title(f"Shear Force Diagram  —  {disp_key} (kN)" + (f"  —  {t_label}" if t_label else ""), fontsize=12, fontweight="bold", pad=12)
     fig._eng_scale = v_scale
     ax.view_init(elev=DEFAULT_ELEV, azim=DEFAULT_AZIM)
     ax.xaxis.pane.fill = False
@@ -897,7 +1012,7 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 # BMD PLOT
 # =============================================================================
 
-def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All"):
+def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All", transverse=None):
     """
     Build a 3-D matplotlib figure showing the Bending Moment Diagram.
 
@@ -920,6 +1035,12 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     v_scale = _value_plot_scale(eng_scale)
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     disp_key = FORCE_DISPLAY.get(force_key, force_key)
+    # Transverse member: re-express it as a single girder (original tags kept).
+    t_label = None
+    if transverse is not None:
+        t_label = transverse["label"]
+        nodes, members = _transverse_view(nodes, members, transverse["elements"])
+        edge_dist, selected_girder = 0.0, "All"
     girders = _find_girders(nodes, members)
 
     fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
@@ -930,7 +1051,10 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     x_range = max(all_xs) - min(all_xs) or 1.0
     z_range = max(all_zs) - min(all_zs) or 1.0
     ax.set_xlim(min(all_xs), max(all_xs))
-    ax.set_ylim(min(all_zs), max(all_zs))
+    _zlo, _zhi = min(all_zs), max(all_zs)
+    if _zhi == _zlo:   # single transverse member: degenerate lateral extent
+        _zlo, _zhi = _zlo - 0.5, _zhi + 0.5
+    ax.set_ylim(_zlo, _zhi)
     ax.set_box_aspect([x_range, z_range, x_range * 0.30])
 
     girder_items_bmd = list(girders.items())
@@ -959,7 +1083,7 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     global_vmax = 0.0
     for i, (z_val, elems) in enumerate(girder_items_bmd):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders_bmd - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
+        girder_name  = t_label or (f"G{i}" if edge_dist > 0 else f"G{i + 1}")
 
         if selected_girder != "All" and girder_name != selected_girder:
             continue
@@ -1089,11 +1213,12 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 
             timer.add_callback(auto_hide)
             timer.start()
-    _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
+    if t_label is None:
+        _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
     _add_node_number_labels(ax, bg_nodes)
     _add_element_number_labels(ax, bg_nodes, bg_members)  # hidden by default; toggled by toolbar
-    ax.set_xlabel("Span Length (m)", fontsize=10, labelpad=8)
-    ax.set_ylabel("Bridge Width (m)", fontsize=10, labelpad=8)
+    ax.set_xlabel("Member Length (m)" if t_label else "Span Length (m)", fontsize=10, labelpad=8)
+    ax.set_ylabel("Span Position (m)" if t_label else "Bridge Width (m)", fontsize=10, labelpad=8)
     ax.set_zlabel(f"{disp_key} (kNm)", fontsize=10, labelpad=8)
     # z-coordinate is y_plot = -Mz * v_scale, so real Mz = -(z / scale)
     _set_value_axis_tick_formatter(ax, v_scale, value_sign=-1.0, use_abs=True)
@@ -1105,7 +1230,7 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     ax.set_zlim(zmin - pad, zmax + pad)
     ax.set_box_aspect([x_range, z_range, (x_range * 0.30) * max(v_scale, 1e-6)])
     ax.yaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]))
-    ax.set_title(f"Bending Moment Diagram  —  {disp_key} (kNm)", fontsize=12, fontweight="bold", pad=12)
+    ax.set_title(f"Bending Moment Diagram  —  {disp_key} (kNm)" + (f"  —  {t_label}" if t_label else ""), fontsize=12, fontweight="bold", pad=12)
     fig._eng_scale = v_scale
     ax.view_init(elev=DEFAULT_ELEV, azim=DEFAULT_AZIM)
     ax.xaxis.pane.fill = False
@@ -1287,13 +1412,19 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 # DEFLECTION PLOT
 # =============================================================================
 
-def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All"):
+def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_scale=1.0, selected_girder="All", transverse=None):
     """
     Build a 3-D matplotlib figure showing the Deflection Diagram.
     """
     v_scale = _value_plot_scale(eng_scale)
     comp_name  = DISP_MAP[disp_key]
     disp_label = DISP_DISPLAY.get(disp_key, disp_key)
+    # Transverse member: re-express it as a single girder (original tags kept).
+    t_label = None
+    if transverse is not None:
+        t_label = transverse["label"]
+        nodes, members = _transverse_view(nodes, members, transverse["elements"])
+        edge_dist, selected_girder = 0.0, "All"
     girders    = _find_girders(nodes, members)
 
     fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
@@ -1377,7 +1508,7 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
 
     for i, (z_val, elems) in enumerate(girder_items):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
+        girder_name  = t_label or (f"G{i}" if edge_dist > 0 else f"G{i + 1}")
 
         if selected_girder != "All" and girder_name != selected_girder:
             continue
@@ -1515,13 +1646,14 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
             timer.start()
 
     # CRITICAL: Draw supports absolute last so they sit on top of the black nodes
-    _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
+    if t_label is None:
+        _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder=selected_girder)
     _add_node_number_labels(ax, bg_nodes)
     _add_element_number_labels(ax, bg_nodes, bg_members)  # hidden by default; toggled by toolbar
 
     # Robust axes and labels
-    ax.set_xlabel("Span Length (m)", fontsize=10, fontweight="bold", labelpad=8)
-    ax.set_ylabel("Bridge Width (m)", fontsize=10, fontweight="bold", labelpad=8)
+    ax.set_xlabel("Member Length (m)" if t_label else "Span Length (m)", fontsize=10, fontweight="bold", labelpad=8)
+    ax.set_ylabel("Span Position (m)" if t_label else "Bridge Width (m)", fontsize=10, fontweight="bold", labelpad=8)
     ax.set_zlabel(f"{disp_label} (mm)", fontsize=10, fontweight="bold", labelpad=8)
     
     from matplotlib.ticker import MaxNLocator
@@ -1536,7 +1668,7 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     ax.set_box_aspect(aspect=(2.5, 1.2, max(v_scale, 1e-6)))
     fig._eng_scale = v_scale
 
-    ax.set_title(f"Deflection Diagram  —  {disp_label} (mm)", fontsize=12, fontweight="bold", pad=12)
+    ax.set_title(f"Deflection Diagram  —  {disp_label} (mm)" + (f"  —  {t_label}" if t_label else ""), fontsize=12, fontweight="bold", pad=12)
     ax.view_init(elev=DEFAULT_ELEV, azim=DEFAULT_AZIM)
     
     # Pane styling
