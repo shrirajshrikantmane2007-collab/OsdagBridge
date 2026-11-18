@@ -3,11 +3,12 @@ Additional Inputs Widget for Highway Bridge Design
 Provides detailed input fields for manual bridge parameter definition
 """
 from copy import deepcopy
+import re
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTabBar, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QSizePolicy,
-    QDialog, QSizePolicy, QSizeGrip,
+    QDialog, QSizePolicy, QSizeGrip, QStackedWidget, QApplication,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QEvent
 from PySide6.QtGui import QDoubleValidator
@@ -57,6 +58,11 @@ class AdditionalInputs(QDialog):
  
         # Store all Compute functions to be called at Design
         self._compute_functions = []
+
+        # True once the user changes any input; cleared on successful Save / (re)load.
+        self.is_modified = False
+        # Set while a user-confirmed close is in progress (closeEvent -> reject chain).
+        self._discard_confirmed = False
 
         self.setObjectName("AdditionalInputs")
         self.setMinimumSize(900, 520)
@@ -156,6 +162,7 @@ class AdditionalInputs(QDialog):
 
         action_bar, self.defaults_button, self.save_button = create_action_button_bar()
         self.defaults_button.clicked.connect(self.reset_active_tab_defaults)
+        self.defaults_button.clicked.connect(self._mark_modified)
 
         from pprint import pprint
         self.defaults_button.clicked.connect(lambda: pprint(self.working_input_dict))
@@ -176,6 +183,9 @@ class AdditionalInputs(QDialog):
         self._enforce_decimal_places(2)
         # Normalize existing numeric text to 2 decimal places for consistent display
         self._normalize_numeric_texts(2)
+
+        # Track user edits (user-only signals: programmatic setText/setCurrentText never fire them)
+        self._connect_modification_tracking()
 
         # self._print_widget_tree()
 
@@ -245,6 +255,9 @@ class AdditionalInputs(QDialog):
             self.interacted_first = False
             from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import END_CONNECTORS
             UIBuilder.wire_end_connectors(END_CONNECTORS, ai=self)
+
+        # Freshly loaded from the committed dictionary: nothing to discard.
+        self.is_modified = False
 
     def set_defaults(self) -> None:  # lifecycle: populates all widgets from working_input_dict; called at init time only
         """
@@ -506,7 +519,126 @@ class AdditionalInputs(QDialog):
 
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
+    # ── Modification tracking / validation / close handling ────────────────────
+
+    # Dependent field -> combos that must ALL read "Custom" for the field to be required.
+    # Keys come from common.py; the dependent fields are the ones the on_change handlers
+    # above enable only for Custom (crash barrier, median, railing, wearing course).
+    _CUSTOM_DEPENDENCIES = {
+        **{k: (KEY_CB_TYPE,) for k in (KEY_CB_DENSITY, KEY_CB_WIDTH, KEY_CB_HEIGHT, KEY_CB_AREA, KEY_CB_LOAD)},
+        **{k: (KEY_MD_TYPE,) for k in (KEY_MD_DENSITY, KEY_MD_WIDTH, KEY_MD_HEIGHT, KEY_MD_AREA, KEY_MD_LOAD)},
+        KEY_RL_WIDTH:      (KEY_RL_TYPE,),
+        KEY_RL_HEIGHT:     (KEY_RL_TYPE,),
+        KEY_RL_LOAD_VALUE: (KEY_RL_TYPE, KEY_RL_LOAD_MODE),
+        KEY_WC_DENSITY:    (KEY_WC_MATERIAL,),
+    }
+
+    def _mark_modified(self, *_):  # user-only signals call this; never called during programmatic loading
+        self.is_modified = True
+
+    def _connect_modification_tracking(self) -> None:  # setup: hooks user-only signals of every input widget built so far
+        for w in self.findChildren(QLineEdit):
+            w.textEdited.connect(self._mark_modified)
+        for w in self.findChildren(QComboBox):
+            w.activated.connect(self._mark_modified)
+        for w in self.findChildren(QCheckBox):
+            w.clicked.connect(self._mark_modified)
+
+    def _is_in_active_tab(self, widget) -> bool:  # utility: False if widget sits on a disabled tab page
+        child, parent = widget, widget.parentWidget()
+        while parent is not None and parent is not self:
+            if isinstance(parent, QStackedWidget):
+                tab_widget = parent.parentWidget()
+                if isinstance(tab_widget, QTabWidget):
+                    idx = tab_widget.indexOf(child)
+                    if idx != -1 and not tab_widget.isTabEnabled(idx):
+                        return False
+            child, parent = parent, parent.parentWidget()
+        return True
+
+    def _field_display_name(self, key: str) -> str:  # utility: user-facing parameter name from the field's label
+        label = self.findChild(QLabel, key + "_label")
+        text = re.sub(r"<[^>]+>", "", label.text()) if label else ""
+        text = text.replace("&nbsp;", " ").strip().rstrip(":").strip()
+        return text or key
+
+    def _combo_text(self, key: str) -> str:
+        combo = self.findChild(QComboBox, key)
+        return combo.currentText().strip() if combo else ""
+
+    def _find_empty_custom_parameter(self):  # validation: name of first active Custom parameter with an empty value, else None
+        # 1. Mode combo ("<id>.mode") + value box ("<id>.value") pairs
+        for combo in self.findChildren(QComboBox):
+            name = combo.objectName()
+            if not name.endswith(".mode") or combo.currentText().strip() != "Custom":
+                continue
+            if combo.isHidden() or not self._is_in_active_tab(combo):
+                continue
+            base = name[:-len(".mode")]
+            value = self.findChild(QLineEdit, base + ".value")
+            if value is not None and not value.isHidden() and not value.text().strip():
+                return self._field_display_name(base)
+
+        # 2. Adaptive fields whose controller (design mode) is Custom
+        for adaptive in self.findChildren(AdaptiveWidget):
+            controller = str(self.working_input_dict.get(adaptive._controller_id) or "").strip()
+            if controller != "Custom" or not self._is_in_active_tab(adaptive):
+                continue
+            active = adaptive.currentWidget()
+            edit = active if isinstance(active, QLineEdit) else (active.findChild(QLineEdit) if active else None)
+            if edit is not None and not edit.text().strip():
+                return self._field_display_name(adaptive._field_id)
+
+        # 3. Fields enabled only when their type / material / mode combo is Custom
+        for key, controllers in self._CUSTOM_DEPENDENCIES.items():
+            edit = self.findChild(QLineEdit, key)
+            if edit is None or edit.isHidden() or not self._is_in_active_tab(edit):
+                continue
+            if all(self._combo_text(c) == "Custom" for c in controllers) and not edit.text().strip():
+                return self._field_display_name(key)
+        return None
+
+    def _confirm_discard(self) -> bool:  # close handling: True if the dialog may close
+        if not self.is_modified or self._discard_confirmed:
+            return True
+        choice = CustomMessageBox(
+            title="Unsaved Changes",
+            text="You have unsaved changes. Closing this window will discard them. Do you want to proceed?",
+            buttons=["Discard", "Cancel"],
+            dialogType=MessageBoxType.Warning,
+        ).exec()
+        if choice == "Discard":
+            self._discard_confirmed = True
+            return True
+        return False
+
+    def closeEvent(self, event):  # Qt event: asks before discarding unsaved changes
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        super().closeEvent(event)   # QDialog.closeEvent routes to reject()
+        self._discard_confirmed = False
+        self.is_modified = False
+
+    def reject(self):  # Esc / reject path goes through the same confirmation
+        if not self._confirm_discard():
+            return
+        super().reject()
+        self._discard_confirmed = False
+        self.is_modified = False
+
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+
+        # Block Save when an active parameter is set to Custom but its value is empty.
+        empty_name = self._find_empty_custom_parameter()
+        if empty_name:
+            CustomMessageBox(
+                title="Input Error",
+                text=f"The custom value for '{empty_name}' cannot be empty.",
+                buttons=["OK"],
+                dialogType=MessageBoxType.Critical,
+            ).exec()
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -521,6 +653,9 @@ class AdditionalInputs(QDialog):
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
             self.update_template_page_2d_cad.emit(cad.params)
+
+        # Committed successfully: nothing left to discard.
+        self.is_modified = False
         
         CustomMessageBox(
             title="Saved",
@@ -1306,6 +1441,11 @@ class AdditionalInputs(QDialog):
 
         self.working_input_dict[girder_key] = segments
 
+        # Only user edits (focus inside the table) count; programmatic loads must not.
+        sender, focus = self.sender(), QApplication.focusWidget()
+        if isinstance(sender, QWidget) and focus is not None and (focus is sender or sender.isAncestorOf(focus)):
+            self.is_modified = True
+
         cad = self.findChild(QWidget, KEY_MP_GD_CAD_PREVIEW)
         cad.update_segments(segments)
 
@@ -1467,12 +1607,14 @@ class AdditionalInputs(QDialog):
         gi, mi = self._get_current_girder_member_indices()
         suffix = f".G{gi}.M{mi}"
         self.working_input_dict[field_id + suffix] = result
+        self._mark_modified()
         print(f"[BOUNDS_ACCEPTED] {field_id + suffix} = {result}")
 
     def _on_all_custom_selected(self, field_id: str, chosen: list) -> None:  # on_change: stores TYPE_ALL_CUSTOM selection list under the current member's dynamic key
         gi, mi = self._get_current_girder_member_indices()
         suffix = f".G{gi}.M{mi}"
         self.working_input_dict[field_id + ".selected" + suffix] = chosen
+        self._mark_modified()
         self.working_input_dict[field_id + suffix] = "Custom"
         print(f"[ALL_CUSTOM_SELECTED] {field_id}.selected{suffix} = {chosen}")
 
@@ -1485,6 +1627,7 @@ class AdditionalInputs(QDialog):
             self.working_input_dict[new_key] = copy.deepcopy(self.working_input_dict[k])
 
     def _on_apply_exterior_clicked(self) -> None:  # on_change: applies current girder settings to first and last girders
+        self._mark_modified()
         gi, _ = self._get_current_girder_member_indices()
         count = int(float(str(self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS, 1))))
         targets = {1, count} - {gi}
@@ -1493,6 +1636,7 @@ class AdditionalInputs(QDialog):
         print(f"@@: Applied Girder {gi} settings to exterior girders: {targets}")
 
     def _on_apply_interior_clicked(self) -> None:  # on_change: applies current girder settings to all interior girders
+        self._mark_modified()
         gi, _ = self._get_current_girder_member_indices()
         count = int(float(str(self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS, 1))))
         targets = set(range(2, count)) - {gi}
@@ -1904,6 +2048,7 @@ class AdditionalInputs(QDialog):
         self._update_stiffener_cad()
 
     def _on_stiffener_apply_all_clicked(self) -> None:  # on_click: copies current stiffener config to all other girders/members
+        self._mark_modified()
         import re
         combo = self.findChild(QComboBox, KEY_MP_STIFFENER_SELECT_MEMBER_ID)
         if combo is None:
@@ -2888,6 +3033,7 @@ class AdditionalInputs(QDialog):
             else:
                 updated.append(result)
             self._on_field_edited(KEY_LL_CUSTOM_VEHICLES, updated)
+            self._mark_modified()
             if widget:
                 widget.update(updated)
 
@@ -2910,6 +3056,7 @@ class AdditionalInputs(QDialog):
             else:
                 updated.append(result)
             self._on_field_edited(KEY_LC_COMBINATIONS, updated)
+            self._mark_modified()
             if widget:
                 widget.update(updated)
 
